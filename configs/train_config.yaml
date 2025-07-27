@@ -1,0 +1,80 @@
+# configs/train_config.yaml
+
+# -------------------
+# 模型相关配置
+# -------------------
+model:
+  name: "Qwen/Qwen3-Embedding-0.6B"
+  max_length: 2048
+  quantization_bits: 4 # 使用4-bit量化以节省显存
+  instruction: "Represent this LLVM IR for searching for similar functions:"
+
+# -------------------
+# LoRA (PEFT) 配置
+# -------------------
+lora:
+  r: 8                  # LoRA的秩，16是一个很好的起点
+  lora_alpha: 16         # 通常是r的两倍
+  lora_dropout: 0     # LoRA层的dropout率
+  target_modules:        # 要应用LoRA的模块
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+  bias: "none"
+
+# -------------------
+# 数据相关配置
+# -------------------
+data:
+  # !!! 重要: 请将这些路径替换为您自己脚本生成的真实路径 !!!
+  train_dataset_pool_path: "/home/damaoooo/Downloads/ReLL/data/processed_dataset/train_dataset_pool"
+  train_positive_map_path: "/home/damaoooo/Downloads/ReLL/data/processed_dataset/train_positive_map.pkl"
+  validation_dataset_pool_path: "/home/damaoooo/Downloads/ReLL/data/processed_dataset/validation_dataset_pool"
+  validation_positive_map_path: "/home/damaoooo/Downloads/ReLL/data/processed_dataset/validation_positive_map.pkl"
+
+# -------------------
+# 训练相关配置 (基于我们自定义的 TripletTrainingArguments)
+# -------------------
+training:
+  output_dir: "./experiments/qwen-llvm-finetune" # 模型检查点和输出的保存目录
+  num_train_epochs: 3                            # 训练的总轮数
+  
+  # --- 批量大小和梯度累积 ---
+  per_device_train_batch_size: 4                 # 每张GPU的训练批量大小
+  per_device_eval_batch_size: 16                 # 每张GPU的评估批量大小
+  gradient_accumulation_steps: 4                 # 梯度累积步数 (有效批量大小 = 8 * 4 = 32)
+
+  # --- 优化器和学习率调度器 ---
+  optim: "paged_adamw_8bit"                      # 使用分页AdamW优化器以节省显存
+  learning_rate: 2.0e-5                          # 学习率
+  lr_scheduler_type: "cosine"                    # 使用余弦退火学习率调度器
+  warmup_ratio: 0.05                             # 预热步数占总步数的比例
+
+  # --- 显存和性能优化 ---
+  fp16: false                                    # 不使用fp16
+  bf16: true                                     # 在4090/5090上使用bf16以获得最佳性能和稳定性
+  gradient_checkpointing: true                   # 关键：启用梯度检查点以极大节省显存
+  gradient_checkpointing_kwargs:
+    use_reentrant: false                         # 推荐用于新版PyTorch
+
+  # --- 日志、保存和评估 ---
+  logging_strategy: "steps"
+  logging_steps: 10                              # 每10步记录一次日志
+  eval_strategy: "steps"
+  eval_steps: 500                                # 每500步在验证集上进行一次评估
+  save_strategy: "steps"
+  save_steps: 500                                # 每500步保存一次模型检查点
+  save_total_limit: 3                            # 最多保留3个最新的检查点
+  load_best_model_at_end: true                   # 训练结束后加载最佳模型
+  metric_for_best_model: "eval_loss"             # 使用验证集损失作为评判最佳模型的标准
+  greater_is_better: false                       # 对于损失，值越小越好
+
+  # --- 数据加载器 ---
+  dataloader_num_workers: 8                      # 用于数据加载的CPU核心数
+
+  remove_unused_columns: false
+
+  # --- 我们自定义的参数 ---
+  triplet_margin: 1.0                            # Triplet Loss的margin值
+  label_names: []                                # 明确告知Trainer我们没有标签列，以消除警告
