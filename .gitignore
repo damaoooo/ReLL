@@ -48,3 +48,5 @@ Thumbs.db
 .pytest_cache/
 
 data/
+
+tmp_*
