@@ -1,10 +1,10 @@
+from unsloth import FastLanguageModel
 import logging
 from typing import Dict, Tuple
 
 import torch
 from rich.console import Console
 # --- 核心改动：引入 Unsloth ---
-from unsloth import FastLanguageModel
 from transformers import PreTrainedTokenizer, PreTrainedModel
 
 # 使用Rich打印美观的日志信息
@@ -114,10 +114,10 @@ def debug_unsloth_model_loading():
 
         # --- 前向传播 ---
         with torch.no_grad(): # 在推理/调试时不需要计算梯度
-            outputs = model(**inputs)
+            outputs = model(**inputs, output_hidden_states=True)
         
         logging.info("前向传播成功！")
-        console.log(f"模型输出 (last_hidden_state) 的形状: [bold green]{outputs.last_hidden_state.shape}[/bold green]")
+        console.log(f"模型输出 (last_hidden_state) 的形状: [bold green]{outputs.hidden_states[-1].shape}[/bold green]")
         console.rule("[bold green]调试成功！Unsloth模型可以在您的GPU上正常运行。[/bold green]")
 
     except Exception as e:

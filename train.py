@@ -2,6 +2,13 @@ import os
 # 在导入任何Hugging Face库之前，设置这个环境变量
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+from unsloth import unsloth_train
+# --- 引入我们项目中的其他模块 ---
+
+from src.dataset import OnlineTripletDataset, TripletDataCollator
+from src.model import load_model_and_tokenizer
+from src.trainer import TripletTrainer, TripletTrainingArguments
+
 import logging
 from pathlib import Path
 
@@ -12,10 +19,7 @@ from rich.console import Console
 from rich.logging import RichHandler
 from transformers import set_seed
 
-# --- 引入我们项目中的其他模块 ---
-from src.dataset import OnlineTripletDataset, TripletDataCollator
-from src.model import load_model_and_tokenizer
-from src.trainer import TripletTrainer, TripletTrainingArguments
+
 
 # --- 设置 Rich 和 Typer ---
 logging.basicConfig(
@@ -100,7 +104,8 @@ def main(
     
     # --- 6. 开始训练 ---
     console.rule("[bold green]开始训练[/bold green]")
-    train_result = trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+    # train_result = trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+    train_result = unsloth_train(trainer, resume_from_checkpoint=resume_from_checkpoint)
 
     # --- 7. 保存最终的模型和状态 ---
     logging.info("训练完成。正在保存最终的模型适配器...")
