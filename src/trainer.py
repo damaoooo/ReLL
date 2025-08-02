@@ -67,6 +67,58 @@ class TripletTrainer(Trainer):
 
         return (loss, {"loss": loss}) if return_outputs else loss
 
+    def prediction_step(self, model, inputs, prediction_loss_only: bool = True, ignore_keys=None):
+        """
+        重写 prediction_step 方法来处理 evaluation 阶段的 triplet 数据格式。
+        """
+        inputs = self._prepare_inputs(inputs)
+        
+        with torch.no_grad():
+            # 使用与 compute_loss 相同的逻辑计算损失
+            loss = self.compute_loss(model, inputs)
+            
+            if prediction_loss_only:
+                return (loss, None, None)
+            
+            # 为了兼容评估逻辑，我们需要返回一些 logits
+            # 这里我们返回 triplet embeddings 作为 "predictions"
+            anchor_outputs = model(
+                input_ids=inputs["anchor_input_ids"],
+                attention_mask=inputs["anchor_attention_mask"],
+            )
+            positive_outputs = model(
+                input_ids=inputs["positive_input_ids"],
+                attention_mask=inputs["positive_attention_mask"],
+            )
+            negative_outputs = model(
+                input_ids=inputs["negative_input_ids"],
+                attention_mask=inputs["negative_attention_mask"],
+            )
+
+            anchor_emb = self.last_token_pool(anchor_outputs.last_hidden_state, inputs["anchor_attention_mask"])
+            positive_emb = self.last_token_pool(positive_outputs.last_hidden_state, inputs["positive_attention_mask"])
+            negative_emb = self.last_token_pool(negative_outputs.last_hidden_state, inputs["negative_attention_mask"])
+
+            # 归一化embeddings
+            eps = 1e-8
+            anchor_emb = F.normalize(anchor_emb, p=2, dim=1, eps=eps)
+            positive_emb = F.normalize(positive_emb, p=2, dim=1, eps=eps)
+            negative_emb = F.normalize(negative_emb, p=2, dim=1, eps=eps)
+            
+            # 计算anchor与positive和negative之间的相似度（余弦相似度）
+            # 由于embeddings已经归一化，点积就是余弦相似度
+            anchor_pos_sim = torch.sum(anchor_emb * positive_emb, dim=1, keepdim=True)  # [batch_size, 1]
+            anchor_neg_sim = torch.sum(anchor_emb * negative_emb, dim=1, keepdim=True)  # [batch_size, 1]
+            
+            # 将相似度拼接作为 predictions: [anchor_pos_sim, anchor_neg_sim]
+            # 这样可以直接分析模型是否学会了让anchor与positive更相似，与negative更不相似
+            predictions = torch.cat([anchor_pos_sim, anchor_neg_sim], dim=1)  # [batch_size, 2]
+            
+            # 由于这是无监督学习，我们没有真实的标签，返回 None
+            labels = None
+            
+        return (loss, predictions, labels)
+
 @dataclass
 class TripletTrainingArguments(TrainingArguments):
     """
@@ -132,7 +184,38 @@ def debug_trainer():
         console.log(f"成功计算损失！ Loss: [bold green]{loss.item()}[/bold green]")
         assert isinstance(loss, torch.Tensor) and loss.ndim == 0, "Loss必须是一个标量张量"
 
-        console.rule("[bold green]调试成功！Trainer 核心逻辑工作正常。[/bold green]")
+        # --- 5. 测试 prediction_step (evaluation逻辑) ---
+        console.log("\n[bold]5. 测试 prediction_step 方法 (evaluation逻辑)...[/bold]")
+        
+        # 测试 prediction_loss_only=True 的情况
+        eval_loss, eval_predictions, eval_labels = trainer.prediction_step(
+            model, dummy_batch, prediction_loss_only=True
+        )
+        console.log(f"prediction_loss_only=True: Loss = [bold green]{eval_loss.item()}[/bold green]")
+        assert eval_predictions is None and eval_labels is None, "prediction_loss_only=True时应该返回None"
+        
+        # 测试 prediction_loss_only=False 的情况
+        eval_loss, eval_predictions, eval_labels = trainer.prediction_step(
+            model, dummy_batch, prediction_loss_only=False
+        )
+        console.log(f"prediction_loss_only=False: Loss = [bold green]{eval_loss.item()}[/bold green]")
+        console.log(f"  - Predictions shape: [bold cyan]{list(eval_predictions.shape)}[/bold cyan]")
+        console.log(f"  - Anchor-Positive 相似度: [bold yellow]{eval_predictions[0, 0].item():.4f}[/bold yellow]")
+        console.log(f"  - Anchor-Negative 相似度: [bold yellow]{eval_predictions[0, 1].item():.4f}[/bold yellow]")
+        
+        # 验证predictions的形状和内容
+        assert eval_predictions.shape == (debug_batch_size, 2), f"Predictions形状应该是({debug_batch_size}, 2)"
+        assert eval_labels is None, "labels应该是None（无监督学习）"
+        
+        # 验证相似度值在合理范围内（-1到1之间）
+        pos_sim = eval_predictions[0, 0].item()
+        neg_sim = eval_predictions[0, 1].item()
+        assert -1 <= pos_sim <= 1, f"Positive相似度应该在[-1,1]范围内，但得到{pos_sim}"
+        assert -1 <= neg_sim <= 1, f"Negative相似度应该在[-1,1]范围内，但得到{neg_sim}"
+        
+        console.log("[bold green]✓ prediction_step 测试通过！[/bold green]")
+
+        console.rule("[bold green]调试成功！Trainer 训练和评估逻辑都工作正常。[/bold green]")
 
     except FileNotFoundError:
         console.print(f"[bold red]错误: 找不到数据文件。[/bold red]")

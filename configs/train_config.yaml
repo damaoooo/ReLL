@@ -32,6 +32,11 @@ data:
   train_positive_map_path: "data/processed_dataset/train_positive_map.pkl"
   validation_dataset_pool_path: "data/processed_dataset/validation_dataset_pool"
   validation_positive_map_path: "data/processed_dataset/validation_positive_map.pkl"
+  # --- 核心修正：定义每轮的步数 ---
+  # 这会将训练时间从几百小时缩短到可控范围
+  steps_per_epoch: 50000
+  # 验证集也可以有独立的步数，通常设置得小一些
+  steps_per_epoch_eval: 128
 
 # -------------------
 # 训练相关配置
@@ -40,9 +45,9 @@ training:
   output_dir: "./experiments/qwen-llvm-finetune-hf" # 建议使用新目录
   num_train_epochs: 3
   
-  per_device_train_batch_size: 24 # 您可以根据显存情况调整
-  per_device_eval_batch_size: 16
-  gradient_accumulation_steps: 4
+  per_device_train_batch_size: 16 # 您可以根据显存情况调整
+  per_device_eval_batch_size: 8
+  gradient_accumulation_steps: 1 # 显存充足时，设为1以最大化速度
 
   optim: "paged_adamw_8bit"
   learning_rate: 2.0e-5 # 建议从一个较低的学习率开始
@@ -51,7 +56,7 @@ training:
 
   fp16: false
   bf16: true
-  gradient_checkpointing: true
+  gradient_checkpointing: false
 
   logging_strategy: "steps"
   logging_steps: 10

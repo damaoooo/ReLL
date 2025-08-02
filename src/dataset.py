@@ -2,7 +2,7 @@ import pickle
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import torch
 from datasets import Dataset, load_from_disk
@@ -19,57 +19,56 @@ class OnlineTripletDataset(TorchDataset):
     一个用于对比学习的PyTorch数据集。
     它在每次被调用时，动态地从数据池中采样一个 (Anchor, Positive, Negative) 三元组。
     """
-    def __init__(self, dataset_pool_path: str, positive_map_path: str):
+    def __init__(self, dataset_pool_path: str, positive_map_path: str, steps_per_epoch: Optional[int] = None):
         """
         初始化数据集。
 
         Args:
-            dataset_pool_path (str): 由 '03_split_dataset.py' 生成的数据集池路径。
-            positive_map_path (str): 由 '03_split_dataset.py' 生成的正样本映射.pkl文件路径。
+            dataset_pool_path (str): 数据集池路径。
+            positive_map_path (str): 正样本映射.pkl文件路径。
+            steps_per_epoch (Optional[int]): 【关键】定义一轮的步数。如果为None，则一轮会遍历所有锚点。
         """
         super().__init__()
-        # 加载包含所有函数文本的数据池
         self.dataset_pool = load_from_disk(dataset_pool_path)
-        # --- 核心修正 ---
-        # console.log() 不接受 'extra' 参数。Markup默认是开启的。
         console.log(f"加载自 [cyan]{dataset_pool_path}[/cyan] 的数据集池，共 {len(self.dataset_pool):,} 个函数。")
 
-        # 加载正样本映射
         with open(positive_map_path, 'rb') as f:
             self.positive_map = pickle.load(f)
-        # --- 核心修正 ---
         console.log(f"加载自 [cyan]{positive_map_path}[/cyan] 的正样本映射。")
         
-        # 我们的 "dataset" 是所有可以作为锚点的函数，即 positive_map 的键。
-        # 对键进行排序可以保证每次运行时的顺序一致性。
         self.anchor_indices = sorted(list(self.positive_map.keys()))
         self.total_functions_in_pool = len(self.dataset_pool)
         
-        # --- 核心修正 ---
-        console.log(f"初始化完成。可用的锚点数量: [bold green]{len(self.anchor_indices):,}[/bold green]")
+        # --- 核心修正：重新定义数据集的“长度” ---
+        if steps_per_epoch is None:
+            self.length = len(self.anchor_indices)
+            console.log(f"初始化完成。一轮将遍历所有 [bold green]{self.length:,}[/bold green] 个锚点。")
+        else:
+            self.length = steps_per_epoch
+            console.log(f"初始化完成。一轮被定义为 [bold yellow]{self.length:,}[/bold yellow] 个随机采样的步骤。")
+
 
     def __len__(self) -> int:
-        """返回数据集中可作为锚点的样本数量。"""
-        return len(self.anchor_indices)
+        """返回我们定义的一轮的长度。"""
+        return self.length
 
     def __getitem__(self, idx: int) -> Dict[str, str]:
         """
-        根据给定的索引，获取一个 (Anchor, Positive, Negative) 三元组的文本。
+        获取一个 (Anchor, Positive, Negative) 三元组的文本。
+        注意：输入的idx在这里被忽略，我们总是进行随机采样。
         """
-        # 1. 选择锚点 (Anchor)
-        anchor_idx = self.anchor_indices[idx]
+        # --- 核心修正：总是随机采样锚点 ---
+        # 这确保了即使在有限的steps_per_epoch内，我们也能看到多样化的数据。
+        anchor_idx = random.choice(self.anchor_indices)
 
-        # 2. 选择正样本 (Positive)
         positive_idx = random.choice(self.positive_map[anchor_idx])
 
-        # 3. 选择负样本 (Negative)
         negative_idx = random.randint(0, self.total_functions_in_pool - 1)
         
         positive_set_for_anchor = set(self.positive_map[anchor_idx])
         while negative_idx == anchor_idx or negative_idx in positive_set_for_anchor:
             negative_idx = random.randint(0, self.total_functions_in_pool - 1)
 
-        # 4. 从数据池中获取这三个样本的 'text' 字段
         anchor_text = self.dataset_pool[anchor_idx]['text']
         positive_text = self.dataset_pool[positive_idx]['text']
         negative_text = self.dataset_pool[negative_idx]['text']
@@ -85,44 +84,29 @@ class OnlineTripletDataset(TorchDataset):
 class TripletDataCollator:
     """
     一个为对比学习三元组任务设计的数据整理器。
-    它接收一批次的文本三元组，并将其转换为模型所需的PyTorch张量。
     """
     tokenizer: PreTrainedTokenizer
     max_length: int
-    # --- 新增：为模型添加指令 ---
     instruction: str = "Represent this LLVM IR for searching for similar functions:"
 
     def __call__(self, examples: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        # 1. 从批次中分离出文本列表，并在每个文本前加上指令
         anchor_texts = [self.instruction + e["anchor"] for e in examples]
         positive_texts = [self.instruction + e["positive"] for e in examples]
         negative_texts = [self.instruction + e["negative"] for e in examples]
 
-        # 2. 将这三组文本分别进行 tokenize 和 padding。
-        #    这是截断(truncation)发生的地方。
         anchor_inputs = self.tokenizer(
-            anchor_texts,
-            padding="max_length", # 填充到max_length
-            truncation=True,      # 超过max_length则截断
-            max_length=self.max_length,
-            return_tensors="pt"
+            anchor_texts, padding="max_length", truncation=True,
+            max_length=self.max_length, return_tensors="pt"
         )
         positive_inputs = self.tokenizer(
-            positive_texts,
-            padding="max_length",
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors="pt"
+            positive_texts, padding="max_length", truncation=True,
+            max_length=self.max_length, return_tensors="pt"
         )
         negative_inputs = self.tokenizer(
-            negative_texts,
-            padding="max_length",
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors="pt"
+            negative_texts, padding="max_length", truncation=True,
+            max_length=self.max_length, return_tensors="pt"
         )
 
-        # 3. 将所有 tokenized inputs 组合到一个字典中返回
         batch = {
             "anchor_input_ids": anchor_inputs.input_ids,
             "anchor_attention_mask": anchor_inputs.attention_mask,
@@ -144,14 +128,15 @@ def debug_dataset_and_collator():
         # !!! 重要: 请将下面的路径替换为您自己脚本生成的真实路径 !!!
         dataset_pool_path = "data/processed_dataset/train_dataset_pool"
         positive_map_path = "data/processed_dataset/train_positive_map.pkl"
-        model_name = "Qwen/Qwen3-Embedding-0.6B"
+        model_name = "Qwen/Qwen2-Embedding-0.5B"
         max_length = 2048
 
         # --- 1. 测试 OnlineTripletDataset ---
         console.log("[bold]1. 测试 OnlineTripletDataset...[/bold]")
         train_dataset = OnlineTripletDataset(
             dataset_pool_path=dataset_pool_path,
-            positive_map_path=positive_map_path
+            positive_map_path=positive_map_path,
+            steps_per_epoch=100 # 在调试时使用一个小的虚拟epoch长度
         )
         
         # 从数据集中取一个样本进行检查

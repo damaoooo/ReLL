@@ -60,13 +60,16 @@ def main(
 
     # --- 3. 加载数据集和DataCollator ---
     logging.info("正在准备训练和验证数据集...")
+    # --- 核心修正：传递 steps_per_epoch 参数 ---
     train_dataset = OnlineTripletDataset(
         dataset_pool_path=data_config['train_dataset_pool_path'],
-        positive_map_path=data_config['train_positive_map_path']
+        positive_map_path=data_config['train_positive_map_path'],
+        steps_per_epoch=data_config.get('steps_per_epoch') # 使用.get()以保持向后兼容
     )
     validation_dataset = OnlineTripletDataset(
         dataset_pool_path=data_config['validation_dataset_pool_path'],
-        positive_map_path=data_config['validation_positive_map_path']
+        positive_map_path=data_config['validation_positive_map_path'],
+        steps_per_epoch=data_config.get('steps_per_epoch_eval') # 验证集使用独立的步数配置
     )
     
     data_collator = TripletDataCollator(
