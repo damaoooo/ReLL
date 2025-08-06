@@ -180,7 +180,7 @@ def split_and_save_dataset(
 def main(
     dataset_path: Path = typer.Argument(..., help="由上一步脚本创建的Hugging Face数据集的路径。", exists=True, file_okay=False, dir_okay=True, readable=True),
     output_dir: Path = typer.Argument(..., help="用于保存训练/验证集产物的输出目录。", file_okay=False, dir_okay=True, writable=True),
-    train_ratio: float = typer.Option(0.9, "--ratio", "-r", help="训练集所占的比例。", min=0.1, max=0.99),
+    train_ratio: float = typer.Option(0.9, "--ratio", "-r", help="训练集所占的比例。", min=0.1, max=1),
     seed: int = typer.Option(42, "--seed", "-s", help="用于保证划分可复现的随机种子。")
 ):
     """
