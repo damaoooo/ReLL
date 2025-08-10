@@ -45,9 +45,9 @@ def build_positive_map(dataset: Dataset) -> Dict[int, List[int]]:
     normalized_names = df['file_name'].str.replace('_functions', '', regex=False)
     # 2. 从右边分割，最多分割两次，分离出主体、优化等级和哈希值
     #    例如 '...so-Os-hash' -> ['...so', 'Os', 'hash']
-    parts = normalized_names.str.rsplit('-', n=2)
+    parts = normalized_names.str.rsplit('_', n=0)
     # 3. 提取主体部分作为源二进制文件名
-    df['source_binary_name'] = parts.str[0]
+    df['source_binary_name'] = parts.str[-1]
     
     logging.info(f"文件名规范化完成。示例: '[cyan]{df['file_name'].iloc[0]}[/cyan]' -> '[green]{df['source_binary_name'].iloc[0]}[/green]'", extra={"markup": True})
 

@@ -28,10 +28,10 @@ lora:
 # 数据相关配置
 # -------------------
 data:
-  train_dataset_pool_path: "data/processed_dataset/train_dataset_pool"
-  train_positive_map_path: "data/processed_dataset/train_positive_map.pkl"
-  validation_dataset_pool_path: "data/processed_dataset/validation_dataset_pool"
-  validation_positive_map_path: "data/processed_dataset/validation_positive_map.pkl"
+  train_dataset_pool_path: "data/processed_db1_dataset/train_dataset_pool"
+  train_positive_map_path: "data/processed_db1_dataset/train_positive_map.pkl"
+  validation_dataset_pool_path: "data/processed_db1_dataset/validation_dataset_pool"
+  validation_positive_map_path: "data/processed_db1_dataset/validation_positive_map.pkl"
   # --- 核心修正：定义每轮的步数 ---
   # 这会将训练时间从几百小时缩短到可控范围
   steps_per_epoch: 50000
@@ -42,7 +42,7 @@ data:
 # 训练相关配置
 # -------------------
 training:
-  output_dir: "./experiments/qwen-llvm-finetune-hf" # 建议使用新目录
+  output_dir: "./experiments/qwen-llvm-finetune-hf-db1" # 建议使用新目录
   num_train_epochs: 3
   
   per_device_train_batch_size: 16 # 您可以根据显存情况调整
