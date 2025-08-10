@@ -1,13 +1,9 @@
 #!/bin/bash
 
 # --- 配置区 ---
-# TEI 镜像
 TEI_IMAGE="ghcr.io/huggingface/text-embeddings-inference:89-1.7"
-# 模型在容器内的路径 (这个通常不需要改)
 MODEL_PATH_INSIDE_CONTAINER="/model"
-# 主机上的数据目录 (相对于此脚本)
 HOST_DATA_PATH="$(pwd)/data"
-# 其他 TEI 参数
 TEI_ARGS="--pooling last-token --max-client-batch-size 256 --max-batch-tokens 300000"
 # ----------------
 
@@ -24,7 +20,6 @@ detect_gpu_count() {
 if [ -z "$1" ]; then
     MAX_GPU_COUNT=$(detect_gpu_count)
     echo "侦测到 $MAX_GPU_COUNT 个可用的 GPU."
-    # 为 GPU 数量的输入也加上 -e
     read -e -p "您想要使用多少个 GPU? (默认: $MAX_GPU_COUNT): " GPU_COUNT
     GPU_COUNT=${GPU_COUNT:-$MAX_GPU_COUNT}
 else
@@ -36,10 +31,9 @@ if ! [[ "$GPU_COUNT" =~ ^[0-9]+$ ]] || [ "$GPU_COUNT" -le 0 ]; then
     exit 1
 fi
 
-# --- 2. 获取模型路径 (已启用Tab自动补全) ---
+# --- 2. 获取模型路径 ---
 DEFAULT_MODEL_PATH="$(pwd)/fused_db1"
 if [ -z "$2" ]; then
-    # 在 read 命令前添加 -e 参数来启用 Readline (包括Tab补全)
     read -e -p "请输入您的模型在主机上的路径 (默认: ${DEFAULT_MODEL_PATH}): " HOST_MODEL_PATH
     HOST_MODEL_PATH=${HOST_MODEL_PATH:-$DEFAULT_MODEL_PATH}
 else
@@ -48,12 +42,13 @@ else
 fi
 
 # 验证模型路径是否存在
+# 使用 realpath 获取绝对路径，避免docker compose处理相对路径'../'时可能出现的问题
+HOST_MODEL_PATH=$(realpath "$HOST_MODEL_PATH")
 if [ ! -d "$HOST_MODEL_PATH" ]; then
     echo "错误：指定的模型路径 '$HOST_MODEL_PATH' 不存在或不是一个目录。"
     exit 1
 fi
 echo "将使用模型路径: $HOST_MODEL_PATH"
-
 
 echo "准备为 $GPU_COUNT 个 GPU 启动 TEI 服务..."
 
@@ -72,14 +67,15 @@ SERVER_BLOCK="server {\n    listen 80;\n\n    location / {\n        proxy_pass h
 
 echo -e "$UPSTREAM_BLOCK\n\n$SERVER_BLOCK" > $NGINX_CONF_PATH
 
-# --- 4. 生成 Docker Compose Override 文件 ---
+# --- 4. 生成 Docker Compose Override 文件 (已修正) ---
 COMPOSE_OVERRIDE_PATH="./docker-compose.override.yml"
 echo "生成 Docker Compose Override 文件于: $COMPOSE_OVERRIDE_PATH"
 
-echo "version: '3.8'
-services:" > $COMPOSE_OVERRIDE_PATH
+# 移除 version 声明
+echo "services:" > $COMPOSE_OVERRIDE_PATH
 
 for i in $(seq 0 $(($GPU_COUNT - 1))); do
+  # 【重要修正】在 deploy.resources.reservations.devices 中移除了 count: 1
   echo "  tei-$i:
     image: ${TEI_IMAGE}
     container_name: tei-instance-${i}
@@ -95,7 +91,6 @@ for i in $(seq 0 $(($GPU_COUNT - 1))); do
         reservations:
           devices:
             - driver: nvidia
-              count: 1
               capabilities: [gpu]
               device_ids: ['${i}']
     restart: unless-stopped
@@ -104,7 +99,19 @@ done
 
 # --- 5. 启动服务 ---
 echo "使用 Docker Compose 启动所有服务..."
+# 运行前最好先清理一次，以防有旧的失败容器残留
+docker-compose -f docker-compose.yml -f $COMPOSE_OVERRIDE_PATH down --remove-orphans > /dev/null 2>&1
 docker-compose -f docker-compose.yml -f $COMPOSE_OVERRIDE_PATH up -d --remove-orphans
+
+# 检查 docker-compose 命令的退出状态
+if [ $? -ne 0 ]; then
+    echo ""
+    echo "--------------------------------------------------"
+    echo "错误：Docker Compose 启动失败！"
+    echo "请检查上面的错误日志。"
+    echo "--------------------------------------------------"
+    exit 1
+fi
 
 echo ""
 echo "部署完成!"
@@ -114,4 +121,5 @@ echo "http://<YOUR_MACHINE_IP>:8080"
 echo ""
 echo "重要提示: 请确保您的主机防火墙允许外部访问 TCP 8080 端口。"
 echo ""
+echo "要查看容器状态, 请运行: docker ps"
 echo "要停止服务, 请运行: docker-compose -f docker-compose.yml -f docker-compose.override.yml down"

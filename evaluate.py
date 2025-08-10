@@ -34,48 +34,77 @@ try:
 except ImportError:
     GPU_AVAILABLE = False
     console.print("[yellow]⚠ 未安装CuPy，将使用CPU计算[/yellow]")
+    
 
 
+# 您的原始函数签名，保持不变
 def generate_embeddings_with_tei(dataset, batch_size: int, instruction: str, tei_endpoint: str, tokenizer, max_length: int) -> np.ndarray:
-    """
-    使用Text Embedding Inference (TEI)服务器为整个数据集生成嵌入向量。
-    在发送前，先在客户端进行精确的、与训练时一致的截断。
-    """
-    all_embeddings = []
-    session = requests.Session()
+    
+    # --- 新增的导入 ---
+    import concurrent.futures
+    import threading
 
-    for i in track(range(0, len(dataset), batch_size), description="正在通过TEI生成嵌入向量..."):
-        batch_texts = dataset[i : i + batch_size]['text']
+    # --- 新增: 为并发请求设置一个线程局部session ---
+    # 这可以避免多线程环境下requests.Session的潜在问题
+    thread_local = threading.local()
+    def get_session():
+        if not hasattr(thread_local, "session"):
+            thread_local.session = requests.Session()
+        return thread_local.session
+
+    # --- 新增: 将循环内的逻辑封装成一个独立的函数 ---
+    # 这个函数将由每个线程来执行，负责处理一个批次
+    def process_one_batch(batch_texts):
+        # 获取当前线程专属的session
+        session = get_session()
         
-        # --- 核心修正：在客户端进行精确截断 ---
-        # 1. 首先将指令和函数文本拼接，完全模拟模型在训练时看到的输入
+        # --- 下面的代码块与您原来的for循环内部完全相同 ---
         instructed_texts = [instruction + text for text in batch_texts]
-
-        # 2. 使用Tokenizer对拼接后的完整文本进行截断
         truncated_inputs = tokenizer(
             instructed_texts,
             truncation=True,
-            max_length=max_length, # 使用我们指定的长度，例如2048
-            padding=False, # 我们不需要padding，只需要截断
+            max_length=max_length,
+            padding=False,
         )
-        # 3. 将截断后的token IDs解码回文本
         final_texts_to_send = tokenizer.batch_decode(truncated_inputs['input_ids'], skip_special_tokens=True)
-        
-        # 4. 发送给TEI，此时不再需要TEI进行截断
         payload = {"inputs": final_texts_to_send}
         
         try:
             response = session.post(f"{tei_endpoint}/embed", json=payload, timeout=60)
             response.raise_for_status()
-            
-            batch_embeddings = np.array(response.json(), dtype=np.float32)
-            all_embeddings.append(batch_embeddings)
-            
+            return np.array(response.json(), dtype=np.float32)
         except requests.exceptions.RequestException as e:
-            console.print(f"[bold red]错误: TEI请求失败 at batch {i}-{i+batch_size}: {e}[/bold red]")
-            console.print("请确保您的TEI服务器正在运行，并且endpoint地址正确。")
-            raise typer.Exit(code=1)
+            # 当一个请求失败时，打印错误并重新抛出异常
+            # executor.map会捕获这个异常，并在主线程中重新引发它
+            console.print(f"[bold red]错误: 一个并发请求失败: {e}[/bold red]")
+            raise
 
+    # --- 修改: 将原来的for循环替换为ThreadPoolExecutor ---
+
+    # 1. 预先准备好所有的批次数据
+    batches = [dataset[i : i + batch_size]['text'] for i in range(0, len(dataset), batch_size)]
+    
+    # 设置一个合理的并发数，例如8，以确保能充分利用2个GPU
+    # 您可以根据需要调整这个值
+    MAX_WORKERS = 8 
+    all_embeddings = []
+
+    try:
+        # 2. 使用并发执行器来处理所有批次
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            # executor.map会自动处理并发，并按顺序返回结果
+            # 我们将它包裹在 track 中以显示进度条
+            results_iterator = executor.map(process_one_batch, batches)
+            
+            description=f"并发生成嵌入(Workers: {MAX_WORKERS})"
+            all_embeddings = list(track(results_iterator, description=description, total=len(batches)))
+
+    except Exception as e:
+        # 如果任何一个worker线程中出现异常，程序会在这里中断
+        console.print("[bold red]嵌入向量生成过程中发生错误，程序已终止。[/bold red]")
+        raise typer.Exit(code=1)
+
+    # 3. 最后一步与原来相同：将所有结果拼接起来
     return np.vstack(all_embeddings)
 
 

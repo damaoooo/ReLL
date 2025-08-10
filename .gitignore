@@ -57,3 +57,6 @@ test*
 profile.svg
 
 scripts/test.ipynb
+
+tei_deployment/docker-compose.override.yml
+tei_deployment/nginx/nginx.conf

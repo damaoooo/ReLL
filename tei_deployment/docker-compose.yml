@@ -1,11 +1,8 @@
-version: '3.8'
-
 services:
   nginx:
     image: nginx:latest
     container_name: tei-load-balancer
     ports:
-      # 将 "8080:80" 修改为 "0.0.0.0:8080:80"
       - "0.0.0.0:8080:80"
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
