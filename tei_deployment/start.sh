@@ -21,11 +21,11 @@ detect_gpu_count() {
 }
 
 # --- 1. 获取 GPU 数量 ---
-# 检查是否有参数传入，否则提示用户输入
 if [ -z "$1" ]; then
     MAX_GPU_COUNT=$(detect_gpu_count)
     echo "侦测到 $MAX_GPU_COUNT 个可用的 GPU."
-    read -p "您想要使用多少个 GPU? (默认: $MAX_GPU_COUNT): " GPU_COUNT
+    # 为 GPU 数量的输入也加上 -e
+    read -e -p "您想要使用多少个 GPU? (默认: $MAX_GPU_COUNT): " GPU_COUNT
     GPU_COUNT=${GPU_COUNT:-$MAX_GPU_COUNT}
 else
     GPU_COUNT=$1
@@ -36,10 +36,11 @@ if ! [[ "$GPU_COUNT" =~ ^[0-9]+$ ]] || [ "$GPU_COUNT" -le 0 ]; then
     exit 1
 fi
 
-# --- 2. 新增：获取模型路径 ---
+# --- 2. 获取模型路径 (已启用Tab自动补全) ---
 DEFAULT_MODEL_PATH="$(pwd)/fused_db1"
 if [ -z "$2" ]; then
-    read -p "请输入您的模型在主机上的路径 (默认: ${DEFAULT_MODEL_PATH}): " HOST_MODEL_PATH
+    # 在 read 命令前添加 -e 参数来启用 Readline (包括Tab补全)
+    read -e -p "请输入您的模型在主机上的路径 (默认: ${DEFAULT_MODEL_PATH}): " HOST_MODEL_PATH
     HOST_MODEL_PATH=${HOST_MODEL_PATH:-$DEFAULT_MODEL_PATH}
 else
     HOST_MODEL_PATH=$2
