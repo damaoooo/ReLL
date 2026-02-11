@@ -34,7 +34,7 @@ data:
   validation_positive_map_path: "data/processed_db1_dataset/validation_positive_map.pkl"
   # --- 核心修正：定义每轮的步数 ---
   # 这会将训练时间从几百小时缩短到可控范围
-  steps_per_epoch: 50000
+  steps_per_epoch: 600000
   # 验证集也可以有独立的步数，通常设置得小一些
   steps_per_epoch_eval: 128
 
@@ -43,7 +43,7 @@ data:
 # -------------------
 training:
   output_dir: "./experiments/qwen-llvm-finetune-hf-db1" # 建议使用新目录
-  num_train_epochs: 3
+  num_train_epochs: 1
   
   per_device_train_batch_size: 16 # 您可以根据显存情况调整
   per_device_eval_batch_size: 8

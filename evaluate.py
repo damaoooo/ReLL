@@ -9,7 +9,7 @@ import requests
 import typer
 from rich.console import Console
 from rich.logging import RichHandler
-from rich.progress import track
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn, MofNCompleteColumn
 from rich.table import Table
 # --- 核心修正：引入 AutoTokenizer ---
 from transformers import AutoTokenizer, set_seed
@@ -93,11 +93,35 @@ def generate_embeddings_with_tei(dataset, batch_size: int, instruction: str, tei
         # 2. 使用并发执行器来处理所有批次
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             # executor.map会自动处理并发，并按顺序返回结果
-            # 我们将它包裹在 track 中以显示进度条
             results_iterator = executor.map(process_one_batch, batches)
             
-            description=f"并发生成嵌入(Workers: {MAX_WORKERS})"
-            all_embeddings = list(track(results_iterator, description=description, total=len(batches)))
+            # 创建自定义进度条显示实时速度
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                TextColumn("•"),
+                MofNCompleteColumn(),
+                TextColumn("•"),
+                TextColumn("[cyan]{task.fields[speed]:.1f} 函数/秒"),
+                TextColumn("•"),
+                TimeRemainingColumn(),
+            ) as progress:
+                task = progress.add_task(
+                    f"并发生成嵌入(Workers: {MAX_WORKERS})",
+                    total=len(dataset),
+                    speed=0.0
+                )
+                
+                processed_count = 0
+                for batch_emb in results_iterator:
+                    all_embeddings.append(batch_emb)
+                    processed_count += len(batch_emb)
+                    # 更新速度：当前已处理数量 / 经过的时间
+                    elapsed = progress.tasks[0].elapsed or 0.001  # 避免除零
+                    speed = processed_count / elapsed if elapsed > 0 else 0
+                    progress.update(task, advance=len(batch_emb), speed=speed)
 
     except Exception as e:
         # 如果任何一个worker线程中出现异常，程序会在这里中断
@@ -256,21 +280,47 @@ def main(
         temp_results[pool_size] = {k: [0, 0] for k in k_values}
     
     
-    for i in track(range(0, len(anchors_to_evaluate), gpu_batch_size), description="正在评估..."):
-        anchor_batch = anchors_to_evaluate[i:i + gpu_batch_size]
-        result = process_anchor_batch_gpu(
-            all_embeddings_gpu if use_gpu else all_embeddings,
-            anchor_batch,
-            positive_map,
-            pool_sizes,
-            k_values,
-            use_gpu=use_gpu
+    # 使用自定义进度条显示评估速度
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TextColumn("•"),
+        MofNCompleteColumn(),
+        TextColumn("•"),
+        TextColumn("[cyan]{task.fields[speed]:.1f} 锚点/秒"),
+        TextColumn("•"),
+        TimeRemainingColumn(),
+    ) as progress:
+        task = progress.add_task(
+            "正在评估...",
+            total=len(anchors_to_evaluate),
+            speed=0.0
         )
-        # 累加结果
-        for pool_size in pool_sizes:
-            for k in k_values:
-                temp_results[pool_size][k][0] += result[pool_size][k][0]
-                temp_results[pool_size][k][1] += result[pool_size][k][1]
+        
+        processed_anchors = 0
+        for i in range(0, len(anchors_to_evaluate), gpu_batch_size):
+            anchor_batch = anchors_to_evaluate[i:i + gpu_batch_size]
+            result = process_anchor_batch_gpu(
+                all_embeddings_gpu if use_gpu else all_embeddings,
+                anchor_batch,
+                positive_map,
+                pool_sizes,
+                k_values,
+                use_gpu=use_gpu
+            )
+            # 累加结果
+            for pool_size in pool_sizes:
+                for k in k_values:
+                    temp_results[pool_size][k][0] += result[pool_size][k][0]
+                    temp_results[pool_size][k][1] += result[pool_size][k][1]
+            
+            # 更新进度和速度
+            processed_anchors += len(anchor_batch)
+            elapsed = progress.tasks[0].elapsed or 0.001
+            speed = processed_anchors / elapsed if elapsed > 0 else 0
+            progress.update(task, advance=len(anchor_batch), speed=speed)
                 
     # 将结果转换为百分比
     
