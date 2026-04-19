@@ -1,5 +1,6 @@
 import logging
 from pathlib import Path
+from typing import Optional
 import matplotlib.pyplot as plt
 import numpy as np
 import typer
@@ -147,7 +148,7 @@ def main(
     jsonl_path: Path = typer.Argument(..., help="包含数据的JSONL文件路径。", exists=True, file_okay=True, dir_okay=False, readable=True),
     output_dataset_path: Path = typer.Argument(..., help="处理后的Hugging Face数据集的保存路径。", file_okay=False, dir_okay=True, writable=True),
     model_name: str = typer.Option("Qwen/Qwen3-Embedding-0.6B", "--model", "-m", help="用于Tokenization的预训练模型名称。"),
-    cdf_plot_path: Path = typer.Option("token_length_cdf_filtered.png", "--plot-path", "-p", help="生成的CDF图的保存路径。", file_okay=True, dir_okay=False, writable=True),
+    cdf_plot_path: Optional[Path] = typer.Option(None, "--plot-path", "-p", help="生成的CDF图的保存路径。如果指定，将计算并保存CDF图。", file_okay=True, dir_okay=False, writable=True),
     num_proc: int = typer.Option(32, "--num-proc", "-n", help="用于数据处理的并行CPU核心数。"),
     force_rerun: bool = typer.Option(False, "--force-rerun", help="强制重新处理数据，不使用缓存。")
 ):
@@ -160,7 +161,9 @@ def main(
     token_lengths_array = processed_dataset.data.column('token_len')
     
     print_statistics_table(token_lengths_array)
-    plot_cdf(token_lengths_array, cdf_plot_path)
+    
+    if cdf_plot_path is not None:
+        plot_cdf(token_lengths_array, cdf_plot_path)
     
     with console.status("[bold green]正在将最终数据集保存到磁盘...[/bold green]", spinner="earth"):
         processed_dataset.save_to_disk(str(output_dataset_path))

@@ -14,6 +14,9 @@ from rich.table import Table
 # --- 核心修正：引入 AutoTokenizer ---
 from transformers import AutoTokenizer, set_seed
 from datasets import load_from_disk
+from numba import njit, prange, types
+from numba.typed import Dict as NumbaDict
+import torch
 
 
 # --- 设置 Rich 和 Typer ---
@@ -27,14 +30,72 @@ app = typer.Typer(pretty_exceptions_show_locals=False)
 console = Console()
 
 # --- GPU加速支持 ---
-try:
-    import cupy as cp
-    GPU_AVAILABLE = True
-    console.print("[green]✓ GPU加速已启用 (CuPy)[/green]")
-except ImportError:
-    GPU_AVAILABLE = False
-    console.print("[yellow]⚠ 未安装CuPy，将使用CPU计算[/yellow]")
-    
+GPU_AVAILABLE = torch.cuda.is_available()
+if GPU_AVAILABLE:
+    console.print("[green]✓ GPU加速已启用 (PyTorch)[/green]")
+else:
+    console.print("[yellow]⚠ 未检测到可用GPU，将使用CPU计算[/yellow]")
+
+MRR_CUTOFFS = (10, 30)
+
+
+@njit
+def _seed_numba_rng(seed: int) -> None:
+    """为 numba 内部使用的随机数生成器设置种子。"""
+    np.random.seed(seed)
+
+
+def _sanitize_positive_map(positive_map, total_size: int):
+    """清洗 positive_map，移除越界/自指向/重复正样本。"""
+    sanitized = {}
+    stats = {
+        "invalid_anchor": 0,
+        "invalid_positive": 0,
+        "self_positive": 0,
+        "duplicate_positive": 0,
+        "empty_anchor": 0,
+    }
+
+    for raw_anchor_idx, positives in positive_map.items():
+        try:
+            anchor_idx = int(raw_anchor_idx)
+        except (TypeError, ValueError):
+            stats["invalid_anchor"] += 1
+            continue
+
+        if anchor_idx < 0 or anchor_idx >= total_size:
+            stats["invalid_anchor"] += 1
+            continue
+
+        seen = set()
+        cleaned = []
+        for raw_pos_idx in positives:
+            try:
+                pos_idx = int(raw_pos_idx)
+            except (TypeError, ValueError):
+                stats["invalid_positive"] += 1
+                continue
+
+            if pos_idx < 0 or pos_idx >= total_size:
+                stats["invalid_positive"] += 1
+                continue
+            if pos_idx == anchor_idx:
+                stats["self_positive"] += 1
+                continue
+            if pos_idx in seen:
+                stats["duplicate_positive"] += 1
+                continue
+
+            seen.add(pos_idx)
+            cleaned.append(pos_idx)
+
+        if cleaned:
+            sanitized[anchor_idx] = cleaned
+        else:
+            stats["empty_anchor"] += 1
+
+    return sanitized, stats
+
 
 
 # 您的原始函数签名，保持不变
@@ -132,7 +193,76 @@ def generate_embeddings_with_tei(dataset, batch_size: int, instruction: str, tei
     return np.vstack(all_embeddings)
 
 
-def process_anchor_batch_gpu(all_embeddings, anchor_batch, positive_map, pool_sizes, k_values: List[int], use_gpu: bool = True) -> dict:
+@njit
+def _floyd_sample(pop_size: int, sample_size: int) -> np.ndarray:
+    """Floyd算法：在O(k)时间内均匀采样k个不重复整数。"""
+    selected = NumbaDict.empty(key_type=types.int64, value_type=types.boolean)
+    for j in range(pop_size - sample_size, pop_size):
+        t = np.random.randint(0, j + 1)
+        if t in selected:
+            selected[j] = True
+        else:
+            selected[t] = True
+    out = np.empty(sample_size, dtype=np.int64)
+    idx = 0
+    for key in selected.keys():
+        out[idx] = key
+        idx += 1
+    return out
+
+
+@njit
+def _map_exclusions(compressed: np.ndarray, exclude_arr: np.ndarray) -> np.ndarray:
+    """把压缩空间索引映射回真实索引，保证排除表不被选中。"""
+    mapped = compressed.copy()
+    while True:
+        shift = np.searchsorted(exclude_arr, mapped, side="right")
+        new_mapped = compressed + shift
+        if np.all(new_mapped == mapped):
+            return new_mapped
+        mapped = new_mapped
+
+
+@njit
+def _sample_excluding(total_size: int, exclude_arr: np.ndarray, sample_size: int) -> np.ndarray:
+    """在排除表之外做均匀无放回采样，返回真实索引。"""
+    eligible_size = total_size - exclude_arr.size
+    if eligible_size < sample_size:
+        return np.empty(0, dtype=np.int64)
+    compressed = _floyd_sample(eligible_size, sample_size)
+    return _map_exclusions(compressed, exclude_arr)
+
+
+@njit(parallel=True)
+def _build_pools_parallel(anchor_batch: np.ndarray, pos_flat: np.ndarray, pos_offsets: np.ndarray, total_size: int, pool_size: int) -> np.ndarray:
+    """并行构建每个锚点的采样池（CPU多核）。"""
+    batch_size = anchor_batch.size
+    pools = np.full((batch_size, pool_size + 1), -1, dtype=np.int64)
+    for i in prange(batch_size):
+        anchor_idx = anchor_batch[i]
+        start = pos_offsets[anchor_idx]
+        end = pos_offsets[anchor_idx + 1]
+        pos_len = end - start
+        if pos_len <= 0:
+            continue
+        rand_idx = np.random.randint(start, end)
+        positive_anchor_idx = pos_flat[rand_idx]
+        exclude_arr = np.empty(pos_len + 1, dtype=np.int64)
+        exclude_arr[:pos_len] = pos_flat[start:end]
+        exclude_arr[pos_len] = anchor_idx
+        exclude_arr.sort()
+
+        mapped = _sample_excluding(total_size, exclude_arr, pool_size)
+        if mapped.size != pool_size:
+            continue
+
+        pools[i, 0] = positive_anchor_idx
+        pools[i, 1:] = mapped
+
+    return pools
+
+
+def process_anchor_batch_gpu(all_embeddings, anchor_batch, pos_flat, pos_offsets, pool_sizes, k_values: List[int], use_gpu: bool = True):
     """
     处理锚点批次，计算与所有嵌入向量的相似度，并返回Recall@K结果。
     使用GPU加速计算相似度。
@@ -142,53 +272,88 @@ def process_anchor_batch_gpu(all_embeddings, anchor_batch, positive_map, pool_si
         recalls[pool_size] = {}
         for k in k_values:
             recalls[pool_size][k] = [0, 0]  # 每次都创建新的列表
-    
-    anchors = all_embeddings[anchor_batch]
+
+    mrr_stats = {cutoff: [0.0, 0] for cutoff in MRR_CUTOFFS}
+    mrr_pool_stats = {pool_size: [0.0, 0] for pool_size in pool_sizes}
     max_pool_size = max(pool_sizes)
     pool_size = max_pool_size - 1
-    pools = []
-    batch_size = len(anchor_batch)
-    
-    for i in range(batch_size):
-        anchor_idx = anchor_batch[i]
-        positive = positive_map[anchor_idx]
-        positive_anchor_idx = random.choice(positive)
-        
-        while True:
-            # Sample the random Pool
-            candidate_indices = np.random.choice(len(all_embeddings), size=pool_size, replace=False)
-            candidate_indices_set = set(candidate_indices)
-            if positive_anchor_idx in candidate_indices_set or anchor_idx in candidate_indices_set:
-                continue
-            else:
-                batch_pool = np.concatenate(([positive_anchor_idx], candidate_indices))
-                pools.append(batch_pool)
-                break
+    total_size = len(all_embeddings)
+    anchor_batch_arr = np.asarray(anchor_batch, dtype=np.int64)
+    pools = _build_pools_parallel(anchor_batch_arr, pos_flat, pos_offsets, total_size, pool_size)
+    valid_mask = pools[:, 0] >= 0
+    if not np.any(valid_mask):
+        return recalls, mrr_stats, mrr_pool_stats
 
-    pools = np.array(pools)
-    embedding_pools = all_embeddings[pools] # size: (batch_size, pool_size, embedding_dim)
-    anchor_emb = anchors[:, np.newaxis, :]  # size: (batch_size, 1, embedding_dim)
-    
+    pools = pools[valid_mask]
+    anchor_batch_arr = anchor_batch_arr[valid_mask]
 
-    anchor_emb_gpu = cp.asarray(anchor_emb)
-    embedding_pools_gpu = cp.asarray(embedding_pools)
-    similarities = cp.einsum('bij,bkj->bik', anchor_emb_gpu, embedding_pools_gpu)
-    similarities = cp.squeeze(similarities, axis=1)  # size: (batch_size, pool_size)
+    if use_gpu:
+        device = all_embeddings.device
+        anchor_idx = torch.from_numpy(anchor_batch_arr).to(device=device, dtype=torch.long)
+        pool_idx = torch.from_numpy(pools).to(device=device, dtype=torch.long)
+        with torch.inference_mode():
+            anchors = all_embeddings.index_select(0, anchor_idx)
+            embedding_pools = all_embeddings.index_select(0, pool_idx.view(-1)).view(pool_idx.shape[0], pool_idx.shape[1], -1)
+            anchor_emb = anchors.unsqueeze(1)
+            similarities = torch.bmm(embedding_pools, anchor_emb.transpose(1, 2)).squeeze(-1)
+    else:
+        anchors = all_embeddings[anchor_batch_arr]
+        embedding_pools = all_embeddings[pools]
+        anchor_emb = anchors[:, np.newaxis, :]
+        similarities = np.matmul(embedding_pools, np.transpose(anchor_emb, (0, 2, 1))).squeeze(-1)
 
+    # 计算MRR（在最大pool中取排名，超过阈值则记为0）
+    mrr_sim_slice = similarities[:, :similarities.shape[1]]
+    pos_scores = mrr_sim_slice[:, 0:1]
+    if use_gpu:
+        count_greater = (mrr_sim_slice > pos_scores).sum(dim=1)
+        ranks = count_greater + 1
+    else:
+        count_greater = (mrr_sim_slice > pos_scores).sum(axis=1)
+        ranks = count_greater + 1
+    for cutoff in MRR_CUTOFFS:
+        mrr_cutoff = min(cutoff, mrr_sim_slice.shape[1])
+        if use_gpu:
+            mrr_scores = torch.where(ranks <= mrr_cutoff, 1.0 / ranks.to(dtype=torch.float32), torch.zeros_like(ranks, dtype=torch.float32))
+            mrr_stats[cutoff][0] += float(mrr_scores.sum().item())
+            mrr_stats[cutoff][1] += int(mrr_scores.numel())
+        else:
+            mrr_scores = np.where(
+                ranks <= mrr_cutoff,
+                1.0 / ranks.astype(np.float32),
+                0.0,
+            )
+            mrr_stats[cutoff][0] += float(mrr_scores.sum())
+            mrr_stats[cutoff][1] += int(mrr_scores.size)
 
-        
-    # 计算Recall@K
+    # 计算Recall@K（不做全量排序，直接比较正样本得分排名）
     for pool_size in pool_sizes:
-        top_indices = cp.argsort(cp.argsort(-similarities[:, :pool_size], axis=1), axis=1)[:, 0] + 1
+        sim_slice = similarities[:, :pool_size]
+        pos_scores = sim_slice[:, 0:1]
+        if use_gpu:
+            count_greater = (sim_slice > pos_scores).sum(dim=1)
+            ranks = count_greater + 1
+            mrr_pool_scores = 1.0 / ranks.to(dtype=torch.float32)
+            mrr_pool_stats[pool_size][0] += float(mrr_pool_scores.sum().item())
+            mrr_pool_stats[pool_size][1] += int(mrr_pool_scores.numel())
+        else:
+            count_greater = (sim_slice > pos_scores).sum(axis=1)
+            ranks = count_greater + 1
+            mrr_pool_scores = 1.0 / ranks.astype(np.float32)
+            mrr_pool_stats[pool_size][0] += float(mrr_pool_scores.sum())
+            mrr_pool_stats[pool_size][1] += int(mrr_pool_scores.size)
         for k in k_values:
-            success, total = 0, 0
-            success = (top_indices <= k).sum()
-            total = len(top_indices)
+            if use_gpu:
+                success = (count_greater < k).sum().item()
+                total = int(count_greater.numel())
+            else:
+                success = int((count_greater < k).sum())
+                total = int(count_greater.size)
             assert success <= total, f"Success count {success} cannot be greater than total {total}."
             recalls[pool_size][k][0] += success
             recalls[pool_size][k][1] += total
 
-    return recalls
+    return recalls, mrr_stats, mrr_pool_stats
 
 
 @app.command()
@@ -210,14 +375,17 @@ def main(
     """
     console.rule(f"[bold blue]开始使用TEI进行模型评估[/bold blue]")
     set_seed(seed)
+    _seed_numba_rng(seed)
     
     # GPU可用性检查
     if use_gpu and not GPU_AVAILABLE:
-        console.print("[yellow]⚠ 请求使用GPU但CuPy不可用，将回退到CPU计算[/yellow]")
+        console.print("[yellow]⚠ 请求使用GPU但PyTorch不可用，将回退到CPU计算[/yellow]")
         use_gpu = False
     
     if use_gpu:
         console.print(f"[green]🚀 将使用GPU加速，批量大小: {gpu_batch_size}[/green]")
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
     else:
         console.print("[blue]💻 使用CPU计算[/blue]")
     
@@ -226,6 +394,17 @@ def main(
     validation_dataset = load_from_disk(str(validation_dataset_pool_path))
     with open(validation_positive_map_path, 'rb') as f:
         positive_map = pickle.load(f)
+    positive_map, positive_map_stats = _sanitize_positive_map(positive_map, len(validation_dataset))
+    sanitized_count = sum(positive_map_stats.values())
+    if sanitized_count > 0:
+        logging.warning(
+            "positive_map 已清洗: "
+            f"invalid_anchor={positive_map_stats['invalid_anchor']}, "
+            f"invalid_positive={positive_map_stats['invalid_positive']}, "
+            f"self_positive={positive_map_stats['self_positive']}, "
+            f"duplicate_positive={positive_map_stats['duplicate_positive']}, "
+            f"empty_anchor={positive_map_stats['empty_anchor']}"
+        )
     # 加载Tokenizer用于客户端截断
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-Embedding-0.6B", trust_remote_code=True)
 
@@ -246,30 +425,69 @@ def main(
             np.save(embeddings_path, all_embeddings)
             logging.info("缓存完成。")
 
+    if len(all_embeddings) != len(validation_dataset):
+        console.print(
+            "[bold red]错误: 嵌入向量数量与验证集大小不一致。"
+            f" embeddings={len(all_embeddings)}, dataset={len(validation_dataset)}[/bold red]"
+        )
+        raise typer.Exit(code=1)
+
     # --- 3. GPU内存预处理 ---
     if use_gpu:
-        logging.info("正在将嵌入向量转移到GPU...")
-        all_embeddings_gpu = cp.asarray(all_embeddings)
-        logging.info(f"GPU内存使用: {all_embeddings_gpu.nbytes / (1024**3):.2f} GB")
+        logging.info("正在将嵌入向量转移到GPU (bfloat16)...")
+        all_embeddings_gpu = torch.as_tensor(all_embeddings, dtype=torch.bfloat16, device="cuda")
+        logging.info(f"GPU内存使用: {all_embeddings_gpu.numel() * all_embeddings_gpu.element_size() / (1024**3):.2f} GB")
     else:
         all_embeddings_gpu = None
 
 
     # --- 4. 设置评估参数 ---
-    pool_sizes = [2**i for i in range(1, 14)] + [100, 10000]
-    # Sort it
-    pool_sizes = sorted(pool_sizes)
-    k_values = sorted([int(k.strip()) for k in ks_str.split(',')])
-    max_k = max(k_values)
+    requested_pool_sizes = sorted(set([2**i for i in range(1, 14)] + [100, 10000]))
+    try:
+        k_values = sorted({int(k.strip()) for k in ks_str.split(',') if k.strip()})
+    except ValueError as exc:
+        console.print(f"[bold red]错误: --ks 参数格式不合法: {ks_str}[/bold red]")
+        raise typer.Exit(code=1) from exc
+    if not k_values or any(k <= 0 for k in k_values):
+        console.print(f"[bold red]错误: --ks 必须是正整数列表，当前值为: {ks_str}[/bold red]")
+        raise typer.Exit(code=1)
     results = {}
+
+    total_size = len(all_embeddings)
+    pos_offsets = np.zeros(total_size + 1, dtype=np.int64)
+    pos_flat_list = []
+    for idx in range(total_size):
+        positives = positive_map.get(idx, [])
+        pos_offsets[idx + 1] = pos_offsets[idx] + len(positives)
+        pos_flat_list.extend(positives)
+    pos_flat = np.asarray(pos_flat_list, dtype=np.int64)
     
     all_possible_anchors = list(positive_map.keys())
+    if not all_possible_anchors:
+        console.print("[bold red]错误: 清洗后的 positive_map 中没有可评估的锚点。[/bold red]")
+        raise typer.Exit(code=1)
+
     if eval_samples > 0 and eval_samples < len(all_possible_anchors):
         logging.info(f"将从 {len(all_possible_anchors):,} 个可能的锚点中随机采样 [yellow]{eval_samples:,}[/yellow] 个进行评估...")
         anchors_to_evaluate = random.sample(all_possible_anchors, eval_samples)
     else:
         logging.info(f"将评估所有 {len(all_possible_anchors):,} 个锚点...")
         anchors_to_evaluate = all_possible_anchors
+
+    max_feasible_pool_size = min(total_size - len(positive_map[anchor_idx]) for anchor_idx in anchors_to_evaluate)
+    pool_sizes = [pool_size for pool_size in requested_pool_sizes if pool_size <= max_feasible_pool_size]
+    dropped_pool_sizes = [pool_size for pool_size in requested_pool_sizes if pool_size > max_feasible_pool_size]
+    if dropped_pool_sizes:
+        logging.warning(
+            "以下 pool size 超出当前评估样本可支持上限，已跳过: "
+            f"{dropped_pool_sizes} (max_feasible_pool_size={max_feasible_pool_size})"
+        )
+    if not pool_sizes:
+        console.print(
+            "[bold red]错误: 当前评估样本不足以构建任意有效检索池。"
+            f" max_feasible_pool_size={max_feasible_pool_size}[/bold red]"
+        )
+        raise typer.Exit(code=1)
 
 
     # --- 5. 对不同的池大小进行评估 ---
@@ -278,6 +496,8 @@ def main(
     temp_results = {}
     for pool_size in pool_sizes:
         temp_results[pool_size] = {k: [0, 0] for k in k_values}
+    total_mrr = {cutoff: [0.0, 0] for cutoff in MRR_CUTOFFS}
+    total_mrr_by_pool = {pool_size: [0.0, 0] for pool_size in pool_sizes}
     
     
     # 使用自定义进度条显示评估速度
@@ -302,10 +522,11 @@ def main(
         processed_anchors = 0
         for i in range(0, len(anchors_to_evaluate), gpu_batch_size):
             anchor_batch = anchors_to_evaluate[i:i + gpu_batch_size]
-            result = process_anchor_batch_gpu(
+            result, batch_mrr, batch_mrr_by_pool = process_anchor_batch_gpu(
                 all_embeddings_gpu if use_gpu else all_embeddings,
                 anchor_batch,
-                positive_map,
+                pos_flat,
+                pos_offsets,
                 pool_sizes,
                 k_values,
                 use_gpu=use_gpu
@@ -315,6 +536,12 @@ def main(
                 for k in k_values:
                     temp_results[pool_size][k][0] += result[pool_size][k][0]
                     temp_results[pool_size][k][1] += result[pool_size][k][1]
+            for cutoff in MRR_CUTOFFS:
+                total_mrr[cutoff][0] += batch_mrr[cutoff][0]
+                total_mrr[cutoff][1] += batch_mrr[cutoff][1]
+            for pool_size in pool_sizes:
+                total_mrr_by_pool[pool_size][0] += batch_mrr_by_pool[pool_size][0]
+                total_mrr_by_pool[pool_size][1] += batch_mrr_by_pool[pool_size][1]
             
             # 更新进度和速度
             processed_anchors += len(anchor_batch)
@@ -339,6 +566,17 @@ def main(
         table.add_row(*row_data)
         
     console.print(table)
+    for cutoff in MRR_CUTOFFS:
+        mrr_value = total_mrr[cutoff][0] / total_mrr[cutoff][1] if total_mrr[cutoff][1] > 0 else 0
+        console.print(f"[bold green]MRR@{cutoff}: {mrr_value:.4f}[/bold green]")
+
+    mrr_pool_table = Table(title="MRR@P 在不同大小检索池中的表现")
+    mrr_pool_table.add_column("Pool Size", justify="right", style="cyan")
+    mrr_pool_table.add_column("MRR@P", justify="right", style="green")
+    for pool_size in pool_sizes:
+        mrr_p = total_mrr_by_pool[pool_size][0] / total_mrr_by_pool[pool_size][1] if total_mrr_by_pool[pool_size][1] > 0 else 0
+        mrr_pool_table.add_row(f"{pool_size:,}", f"{mrr_p:.4f}")
+    console.print(mrr_pool_table)
 
 
 if __name__ == "__main__":
